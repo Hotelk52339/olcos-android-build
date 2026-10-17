@@ -1,0 +1,163 @@
+name: olcOS Android
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Go core and debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout the app
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The Go core lives with the iOS app; its public snapshot carries the
+      # gomobile wrapper, the olcrtc core and the olcos engine.
+      - name: Checkout the Go core snapshot
+        uses: actions/checkout@v5
+        with:
+          repository: Hotelk52339/olcos-ios-build
+          ref: main
+          path: core
+          submodules: recursive
+          persist-credentials: false
+
+      # The closed core patch series comes from a repository secret, like the
+      # iOS build; without it the bare pinned core is bound.
+      - name: Materialize the closed core patch series
+        env:
+          CORE_PATCH_B64: ${{ secrets.CORE_PATCH_B64 }}
+        run: |
+          if [ -n "$CORE_PATCH_B64" ]; then
+            printf '%s' "$CORE_PATCH_B64" | base64 -d | gunzip > core/scripts/olcrtc-core.patch
+            echo "core patch materialized: $(wc -c < core/scripts/olcrtc-core.patch) bytes"
+          else
+            echo "no core patch secret available; binding the bare pinned core"
+          fi
+
+      - name: Core cache key
+        id: corekey
+        run: |
+          echo "key=$(git -C core rev-parse HEAD)-$(sha256sum core/scripts/olcrtc-core.patch 2>/dev/null | cut -c1-16 || echo none)-$(sha256sum scripts/build-core.sh | cut -c1-8)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the bound core
+        id: corecache
+        uses: actions/cache/restore@v5
+        with:
+          path: app/libs/olcoscore.aar
+          key: olcoscore-aar-v1-${{ steps.corekey.outputs.key }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go
+        if: steps.corecache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: core/gomobile/go.mod
+          cache-dependency-path: |
+            core/olcrtc-upstream/go.sum
+            core/olcos-core/go.sum
+            core/gomobile/go.mod
+
+      - name: Bind the Go core
+        if: steps.corecache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: bash scripts/build-core.sh core app/libs/olcoscore.aar
+
+      - name: Save the bound core
+        if: steps.corecache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: app/libs/olcoscore.aar
+          key: ${{ steps.corecache.outputs.cache-primary-key }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      # The app carries the series to put on a server it updates, like the
+      # iOS app does; it is never committed.
+      - name: Give the app the core patch series
+        run: |
+          if [ -s core/scripts/olcrtc-core.patch ]; then
+            cp core/scripts/olcrtc-core.patch app/src/main/assets/scripts/olcrtc-core.patch
+            echo "core patch in the assets: $(wc -c < app/src/main/assets/scripts/olcrtc-core.patch) bytes"
+          else
+            echo "no core patch: a server updated from this build runs the bare pinned core"
+          fi
+
+      # The server installer the app runs over SSH: srv.sh, the agent's status
+      # scripts, the agent's Go sources and the bond endpoint's Go sources
+      # (both built on the server), from the same snapshot; never committed.
+      - name: Give the app the server installer
+        run: |
+          mkdir -p app/src/main/assets/scripts/agent-status app/src/main/assets/agent/cmd/olcos-agent app/src/main/assets/bond/cmd/olcos-bond
+          cp core/scripts/srv.sh app/src/main/assets/scripts/srv.sh
+          cp core/scripts/agent-status/*.sh app/src/main/assets/scripts/agent-status/
+          for f in core/gomobile/agent/*.go; do
+            case "$f" in *_test.go) ;; *) cp "$f" app/src/main/assets/agent/ ;; esac
+          done
+          cp core/gomobile/agent/cmd/olcos-agent/main.go app/src/main/assets/agent/cmd/olcos-agent/main.go
+          for f in core/gomobile/bond/*.go; do
+            case "$f" in *_test.go) ;; *) cp "$f" app/src/main/assets/bond/ ;; esac
+          done
+          cp core/gomobile/bond/cmd/olcos-bond/main.go app/src/main/assets/bond/cmd/olcos-bond/main.go
+          echo "installer in the assets: srv.sh $(wc -c < app/src/main/assets/scripts/srv.sh) bytes, $(ls app/src/main/assets/agent/*.go | wc -l) agent sources, $(ls app/src/main/assets/bond/*.go | wc -l) bond sources"
+
+      - name: Materialize the shared debug keystore
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            printf '%s' "$DEBUG_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/olcos-debug.p12"
+            echo "OLCOS_DEBUG_KEYSTORE=$RUNNER_TEMP/olcos-debug.p12" >> "$GITHUB_ENV"
+            echo "signing with the shared debug keystore"
+          else
+            echo "no DEBUG_KEYSTORE_B64 secret: the runner's own debug keystore signs this APK (it will not install over another build)"
+          fi
+
+      - name: Run the unit tests
+        timeout-minutes: 10
+        run: gradle --no-daemon testDebugUnitTest
+
+      - name: Build the debug and release APKs
+        timeout-minutes: 25
+        run: gradle --no-daemon assembleDebug assembleRelease
+
+      - name: Show the signing certificate
+        run: |
+          TOOLS="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          "$TOOLS/apksigner" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | head -n 3
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: olcos-android-debug.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # The release build, signed with the shared key: what a GitHub release ships.
+      - name: Upload the release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: olcos-android-release.apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
