@@ -1,0 +1,16 @@
+.gradle/
+build/
+*/build/
+.idea/
+*.iml
+local.properties
+.DS_Store
+app/libs/olcoscore.aar
+app/libs/olcoscore-sources.jar
+/core/
+app/src/main/assets/scripts/olcrtc-core.patch
+# The server installer and the agent sources: copied from the core snapshot by CI.
+app/src/main/assets/scripts/srv.sh
+app/src/main/assets/scripts/agent-status/
+app/src/main/assets/agent/
+app/src/main/assets/bond/
